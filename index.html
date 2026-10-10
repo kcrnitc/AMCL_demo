@@ -1,0 +1,228 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>AMCL: how a robot finds itself</title>
+<link href="https://fonts.googleapis.com/css2?family=Chakra+Petch:wght@400;600&display=swap" rel="stylesheet">
+<style>
+:root{--bg:#f1f4f6;--panel:#ffffff;--line:#d3dbe1;--ink:#14202a;--mute:#5a6b78;--wall:#1b2a36;--true:#12a36b;--cloud:#1b8fc4;--hot:#e08a00;--est:#d9246b;
+box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#0e1318;--panel:#141b22;--line:#26323d;--ink:#e8eef2;--mute:#8fa1af;--wall:#e8eef2;--true:#3ddc97;--cloud:#4cc9f0;--hot:#ffd166;--est:#ff4d8d}}
+:root[data-theme="dark"]{--bg:#0e1318;--panel:#141b22;--line:#26323d;--ink:#e8eef2;--mute:#8fa1af;--wall:#e8eef2;--true:#3ddc97;--cloud:#4cc9f0;--hot:#ffd166;--est:#ff4d8d}
+html{scroll-padding-top:env(safe-area-inset-top,0px)}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Chakra Petch",system-ui,sans-serif}
+main{max-width:1120px;margin:0 auto;padding:20px 16px 40px}
+h1{font-size:clamp(1.5rem,3vw,2.1rem);margin:0 0 4px;font-weight:600}
+header p{margin:0 0 18px;color:var(--mute);max-width:70ch}
+.stage{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:760px){.stage{grid-template-columns:1fr}}
+figure{margin:0;background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:10px}
+figcaption{font-weight:600;margin-bottom:6px}
+figcaption small{display:block;font-weight:400;color:var(--mute);font-size:.82rem}
+canvas{width:100%;aspect-ratio:3/2;display:block;border-radius:6px}
+.hud{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;margin:14px 0 6px}
+.chips{display:flex;gap:6px;flex-wrap:wrap}
+.chip{padding:4px 12px;border:1px solid var(--line);border-radius:99px;color:var(--mute);transition:all .15s}
+.chip.on{background:var(--est);border-color:var(--est);color:#fff}
+.stat{color:var(--mute)}.stat b{color:var(--ink);font-variant-numeric:tabular-nums}
+.controls{display:flex;flex-wrap:wrap;gap:10px 16px;align-items:center;margin:10px 0 22px}
+button{font:inherit;background:var(--panel);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:6px 14px;cursor:pointer}
+button:hover{border-color:var(--cloud)}
+button:focus-visible,input:focus-visible{outline:2px solid var(--est);outline-offset:2px}
+label{display:flex;gap:8px;align-items:center;color:var(--mute)}
+.notes{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+@media(max-width:760px){.notes{grid-template-columns:1fr}}
+.notes div{border-left:3px solid var(--line);padding-left:12px}
+.notes h2{font-size:1rem;margin:0 0 2px}
+.notes p{margin:0;color:var(--mute);font-size:.92rem}
+</style>
+</head>
+<body>
+<main>
+<header>
+<h1>How a robot finds itself: AMCL</h1>
+<p>The robot does not know where it is. It keeps hundreds of guesses (particles) and lets the lidar decide which ones survive. Left is reality, right is what the robot believes.</p>
+</header>
+
+<section class="stage">
+<figure><figcaption>True pose<small>The real robot and its lidar beams</small></figcaption><canvas id="a"></canvas></figure>
+<figure><figcaption>Map<small>Each arrow is one guess. Pink is the robot's best estimate</small></figcaption><canvas id="b"></canvas></figure>
+</section>
+
+<section class="hud">
+<div class="chips"><span class="chip" id="c0">Move</span><span class="chip" id="c1">Weigh</span><span class="chip" id="c2">Resample</span></div>
+<span class="stat">Particles <b id="sN">0</b></span>
+<span class="stat">Spread <b id="sS">0</b></span>
+<span class="stat">Position error <b id="sE">0</b></span>
+</section>
+
+<section class="controls">
+<button id="bPlay">Pause</button>
+<button id="bReset">Reset (robot is lost)</button>
+<button id="bKid">Kidnap robot</button>
+<button id="bDrive">Drive: auto</button>
+<label>Max particles <input id="rN" type="range" min="100" max="1500" step="100" value="800"></label>
+<label>Filter speed <input id="rS" type="range" min="0.4" max="3" step="0.1" value="1"></label>
+<label><input id="cScan" type="checkbox" checked> Show lidar</label>
+</section>
+
+<section class="notes">
+<div><h2>1. Move</h2><p>Every particle copies the robot's odometry plus a little noise, because wheels slip. Use arrow keys or WASD to drive yourself.</p></div>
+<div><h2>2. Weigh</h2><p>Each particle imagines the lidar scan it would see from its own guess. The closer that matches the real scan, the brighter and larger it gets.</p></div>
+<div><h2>3. Resample</h2><p>Bright guesses are cloned, dim ones vanish. When sure, AMCL uses fewer particles. After a kidnap it injects random ones to recover.</p></div>
+</section>
+</main>
+
+<script>
+const W=600,H=400,K=24,MAXR=260,TAU=Math.PI*2;
+const A=document.getElementById('a'),B=document.getElementById('b'),cx=[A.getContext('2d'),B.getContext('2d')];
+const $=id=>document.getElementById(id);
+// ---------- map ----------
+const segs=[],boxes=[[190,120,260,190],[90,270,140,330]];
+function box(x1,y1,x2,y2){segs.push([x1,y1,x2,y1],[x2,y1,x2,y2],[x2,y2,x1,y2],[x1,y2,x1,y1])}
+box(10,10,590,390);boxes.forEach(b=>box(...b));
+segs.push([400,10,400,150],[330,260,480,260],[480,260,480,330]);
+function ray(x,y,a){const dx=Math.cos(a),dy=Math.sin(a);let best=MAXR;
+ for(const s of segs){const ex=s[2]-s[0],ey=s[3]-s[1],den=dx*ey-dy*ex;if(Math.abs(den)<1e-9)continue;
+  const qx=s[0]-x,qy=s[1]-y,t=(qx*ey-qy*ex)/den,u=(qx*dy-qy*dx)/den;if(t>=0&&u>=0&&u<=1&&t<best)best=t}
+ return best}
+function dSeg(px,py,s){const ex=s[2]-s[0],ey=s[3]-s[1];let t=((px-s[0])*ex+(py-s[1])*ey)/(ex*ex+ey*ey);t=Math.max(0,Math.min(1,t));return Math.hypot(px-s[0]-t*ex,py-s[1]-t*ey)}
+function free(x,y,c){if(x<10||x>590||y<10||y>390)return false;
+ for(const b of boxes)if(x>b[0]-c&&x<b[2]+c&&y>b[1]-c&&y<b[3]+c)return false;
+ for(const s of segs)if(dSeg(x,y,s)<c)return false;return true}
+const rnd=(a,b)=>a+Math.random()*(b-a);
+const g=()=>{let u=0;for(let i=0;i<6;i++)u+=Math.random();return(u-3)*1.414};
+function randPose(){let x,y;do{x=rnd(10,590);y=rnd(10,390)}while(!free(x,y,16));return{x,y,th:rnd(0,TAU),w:0,vis:1}}
+function scan(x,y,th,n){const z=[];for(let i=0;i<K;i++)z.push(Math.max(1,Math.min(MAXR,ray(x,y,th+i*TAU/K)+g()*n)));return z}
+
+// ---------- state ----------
+let robot=randPose(),ps=[],est={x:0,y:0,th:0,sd:0},curZ=[],running=true,auto=true,keys={};
+let phase=0,phaseT=0,pulse=-1e9,wslow=0,wfast=0,turning=0,turnDir=1,wander=0,maxN=800,speed=1;
+function initParticles(){const n=maxN;ps=[];for(let i=0;i<n;i++){const p=randPose();p.w=1/n;ps.push(p)}wslow=wfast=0;phase=0;phaseT=0}
+
+// ---------- particle filter ----------
+function weigh(){
+ const z=curZ;let sum=0,avg=0;
+ for(const p of ps){
+  if(!free(p.x,p.y,3)){p.w=0;continue}
+  let mse=0;for(let i=0;i<K;i++){const e=Math.min(80,Math.abs(z[i]-ray(p.x,p.y,p.th+i*TAU/K)));mse+=e*e}
+  p.w=Math.exp(-(mse/K)/392);sum+=p.w}
+ avg=sum/ps.length;
+ if(!wslow){wslow=wfast=Math.max(avg,1e-6)}
+ wslow+=0.1*(avg-wslow);wfast+=0.5*(avg-wfast);
+ let mx=0;
+ if(sum<1e-12){for(const p of ps){p.w=1/ps.length;p.vis=1}}
+ else for(const p of ps){p.w/=sum;if(p.w>mx)mx=p.w}
+ if(sum>=1e-12)for(const p of ps)p.vis=p.w/mx;
+ weigh.avg=avg;weigh.sum=sum;
+}
+function resample(){
+ estimate();
+ const lost=weigh.avg<0.15||wfast<wslow*0.6;
+ const pinj=Math.max(0,1-wfast/wslow);
+ let N=lost?maxN:Math.round(Math.max(80,Math.min(maxN,maxN*Math.min(1,est.sd/110))));
+ N=Math.min(N,maxN);
+ const out=[],n=ps.length;let c=ps[0].w,i=0;const r0=Math.random()/N;
+ for(let m=0;m<N;m++){
+  if(Math.random()<pinj*0.5){const q=randPose();q.w=1/N;out.push(q);continue}
+  const u=r0+m/N;while(u>c&&i<n-1){i++;c+=ps[i].w}
+  const p=ps[i];out.push({x:p.x+g()*1.2,y:p.y+g()*1.2,th:p.th+g()*0.02,w:1/N,vis:1})}
+ ps=out;pulse=performance.now();
+}
+function estimate(){let sx=0,sy=0,sc=0,ss=0,sw=0;
+ for(const p of ps){sw+=p.w;sx+=p.w*p.x;sy+=p.w*p.y;sc+=p.w*Math.cos(p.th);ss+=p.w*Math.sin(p.th)}
+ if(!sw)return;sx/=sw;sy/=sw;let v=0;for(const p of ps)v+=p.w*((p.x-sx)**2+(p.y-sy)**2);
+ est={x:sx,y:sy,th:Math.atan2(ss,sc),sd:Math.sqrt(v/sw)}}
+
+// ---------- simulation step ----------
+function step(dt){
+ let v=0,w=0;
+ if(auto){
+  const f=Math.min(ray(robot.x,robot.y,robot.th),ray(robot.x,robot.y,robot.th+.5),ray(robot.x,robot.y,robot.th-.5));
+  if(turning>0){w=2.2*turnDir;turning-=dt}
+  else if(f<55){turnDir=Math.random()<.5?-1:1;turning=.3+Math.random()*.7}
+  else{v=60;wander=Math.max(-.7,Math.min(.7,wander+(Math.random()-.5)*dt*8));w=wander}
+ }else{
+  if(keys.up)v=60;if(keys.down)v=-40;if(keys.left)w=-2;if(keys.right)w=2}
+ const ahead=ray(robot.x,robot.y,robot.th+(v<0?Math.PI:0));
+ if(ahead<Math.abs(v*dt)+12)v=0;
+ robot.th+=w*dt;robot.x+=Math.cos(robot.th)*v*dt;robot.y+=Math.sin(robot.th)*v*dt;
+ const d=v*dt;
+ if(d||w){
+  for(const p of ps){
+   p.th+=w*dt+g()*(0.004+0.08*Math.abs(w*dt));
+   const dd=d+g()*(0.12*Math.abs(d)+0.02);
+   if(ray(p.x,p.y,p.th+(dd<0?Math.PI:0))>Math.abs(dd)+3){p.x+=Math.cos(p.th)*dd;p.y+=Math.sin(p.th)*dd}}}
+ curZ=scan(robot.x,robot.y,robot.th,2);
+ phaseT+=dt*speed;
+ if(phase===0&&phaseT>=.55){weigh();phase=1;phaseT=0}
+ else if(phase===1&&phaseT>=.7){resample();phase=0;phaseT=0}
+ estimate();
+}
+
+// ---------- drawing ----------
+let C={};
+function readTheme(){const s=getComputedStyle(document.documentElement);for(const k of['panel','line','wall','true','cloud','hot','est','mute'])C[k]=s.getPropertyValue('--'+k).trim()}
+function rgba(h,a){const n=parseInt(h.slice(1),16);return`rgba(${n>>16},${n>>8&255},${n&255},${a})`}
+function mix(a,b,t){const p=parseInt(a.slice(1),16),q=parseInt(b.slice(1),16);const m=(s)=>Math.round((p>>s&255)*(1-t)+(q>>s&255)*t);return`rgb(${m(16)},${m(8)},${m(0)})`}
+function world(ctx,cv){const s=cv.width/W;ctx.setTransform(s,0,0,s,0,0);ctx.clearRect(0,0,W,H);
+ ctx.fillStyle=C.panel;ctx.fillRect(0,0,W,H);
+ ctx.strokeStyle=rgba(C.line,.5);ctx.lineWidth=1;ctx.beginPath();
+ for(let x=50;x<W;x+=50){ctx.moveTo(x,0);ctx.lineTo(x,H)}for(let y=50;y<H;y+=50){ctx.moveTo(0,y);ctx.lineTo(W,y)}ctx.stroke();
+ ctx.strokeStyle=C.wall;ctx.lineWidth=3.5;ctx.lineCap='round';ctx.beginPath();
+ for(const s of segs){ctx.moveTo(s[0],s[1]);ctx.lineTo(s[2],s[3])}ctx.stroke()}
+function body(ctx,x,y,th,col,r){ctx.fillStyle=rgba(col,.9);ctx.strokeStyle=col;ctx.lineWidth=2;ctx.beginPath();ctx.arc(x,y,r,0,TAU);ctx.fill();
+ ctx.strokeStyle=C.panel;ctx.lineWidth=3;ctx.beginPath();ctx.moveTo(x,y);ctx.lineTo(x+Math.cos(th)*r,y+Math.sin(th)*r);ctx.stroke()}
+function draw(now){
+ const showScan=$('cScan').checked;
+ // left: reality
+ world(cx[0],A);let c=cx[0];
+ if(showScan){c.lineWidth=1;for(let i=0;i<K;i++){const a=robot.th+i*TAU/K,z=curZ[i]||0;
+  c.strokeStyle=rgba(C.true,.28);c.beginPath();c.moveTo(robot.x,robot.y);c.lineTo(robot.x+Math.cos(a)*z,robot.y+Math.sin(a)*z);c.stroke();
+  if(z<MAXR-1){c.fillStyle=C.true;c.beginPath();c.arc(robot.x+Math.cos(a)*z,robot.y+Math.sin(a)*z,2.6,0,TAU);c.fill()}}}
+ body(c,robot.x,robot.y,robot.th,C.true,12);
+ // right: belief
+ world(cx[1],B);c=cx[1];
+ c.globalCompositeOperation=document.documentElement.dataset.theme==='light'||!matchMedia('(prefers-color-scheme:dark)').matches?'source-over':'lighter';
+ c.fillStyle=rgba(C.cloud,.07);for(const p of ps){c.beginPath();c.arc(p.x,p.y,10,0,TAU);c.fill()}
+ c.globalCompositeOperation='source-over';
+ const weighing=phase===1;
+ for(const p of ps){
+  const t=weighing?p.vis:0,sz=weighing?3+6*t:4.5;
+  c.save();c.translate(p.x,p.y);c.rotate(p.th);
+  c.fillStyle=weighing?mix(C.cloud,C.hot,t):C.cloud;c.globalAlpha=weighing?.2+.8*t:.75;
+  c.beginPath();c.moveTo(sz*1.5,0);c.lineTo(-sz,sz*.8);c.lineTo(-sz,-sz*.8);c.closePath();c.fill();c.restore()}
+ c.globalAlpha=1;
+ if(showScan){for(let i=0;i<K;i++){const a=est.th+i*TAU/K,z=curZ[i]||0;
+  c.strokeStyle=rgba(C.est,.22);c.lineWidth=1;c.beginPath();c.moveTo(est.x,est.y);c.lineTo(est.x+Math.cos(a)*z,est.y+Math.sin(a)*z);c.stroke();
+  if(z<MAXR-1){c.fillStyle=C.est;c.beginPath();c.arc(est.x+Math.cos(a)*z,est.y+Math.sin(a)*z,2.6,0,TAU);c.fill()}}}
+ c.strokeStyle=C.est;c.lineWidth=3;c.fillStyle=rgba(C.est,.25);c.beginPath();c.arc(est.x,est.y,13,0,TAU);c.fill();c.stroke();
+ c.beginPath();c.moveTo(est.x,est.y);c.lineTo(est.x+Math.cos(est.th)*13,est.y+Math.sin(est.th)*13);c.stroke();
+ const age=(now-pulse)/650;
+ if(age<1){c.strokeStyle=rgba(C.est,1-age);c.lineWidth=3;c.beginPath();c.arc(est.x,est.y,13+age*60,0,TAU);c.stroke()}
+ // hud
+ $('c0').classList.toggle('on',phase===0&&age>=1);$('c1').classList.toggle('on',phase===1);$('c2').classList.toggle('on',age<1);
+ $('sN').textContent=ps.length;$('sS').textContent=est.sd.toFixed(0);$('sE').textContent=Math.hypot(est.x-robot.x,est.y-robot.y).toFixed(0);
+}
+
+// ---------- plumbing ----------
+function fit(){const d=Math.min(2,devicePixelRatio||1);for(const c of[A,B]){c.width=Math.round(c.clientWidth*d);c.height=Math.round(c.clientWidth*d*H/W)}}
+let last=performance.now();
+function frame(now){const dt=Math.min(.05,(now-last)/1000);last=now;readTheme();if(running)step(dt);draw(now);requestAnimationFrame(frame)}
+addEventListener('resize',fit);
+const map={ArrowUp:'up',KeyW:'up',ArrowDown:'down',KeyS:'down',ArrowLeft:'left',KeyA:'left',ArrowRight:'right',KeyD:'right'};
+addEventListener('keydown',e=>{const k=map[e.code];if(!k||e.target.tagName==='INPUT')return;e.preventDefault();keys[k]=true;if(auto){auto=false;$('bDrive').textContent='Drive: manual'}});
+addEventListener('keyup',e=>{const k=map[e.code];if(k)keys[k]=false});
+$('bPlay').onclick=()=>{running=!running;$('bPlay').textContent=running?'Pause':'Play'};
+$('bReset').onclick=initParticles;
+$('bKid').onclick=()=>{robot=randPose();turning=0};
+$('bDrive').onclick=()=>{auto=!auto;$('bDrive').textContent=auto?'Drive: auto':'Drive: manual'};
+$('rN').onchange=e=>{maxN=+e.target.value;initParticles()};
+$('rS').oninput=e=>{speed=+e.target.value};
+fit();readTheme();initParticles();curZ=scan(robot.x,robot.y,robot.th,2);estimate();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
